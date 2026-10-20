@@ -1,0 +1,16 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# Environment secrets — never commit these
+backend/.env
+frontend/.env
+
+# Build output
+frontend/dist/
+frontend/.vite/
+
+# OS
+.DS_Store
+Thumbs.db
+

@@ -1,0 +1,137 @@
+{
+  "version": 1,
+  "author": "FireGuard",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "wokwi-esp32-devkit-v1",
+      "id": "esp32",
+      "top": 100,
+      "left": 20,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-breadboard",
+      "id": "bb1",
+      "top": 100,
+      "left": 300,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-dht22",
+      "id": "dht1",
+      "top": -100,
+      "left": 350,
+      "attrs": {
+        "temperature": "28",
+        "humidity": "55"
+      }
+    },
+    {
+      "type": "wokwi-gas-sensor",
+      "id": "mq2",
+      "top": 320,
+      "left": 350,
+      "attrs": {
+        "ppm": "100",
+        "threshold": "4.4"
+      }
+    },
+    {
+      "type": "wokwi-lcd1602",
+      "id": "lcd1",
+      "top": -100,
+      "left": 650,
+      "attrs": {
+        "pins": "full"
+      }
+    },
+    {
+      "type": "wokwi-buzzer",
+      "id": "buzzer1",
+      "top": 430,
+      "left": 650,
+      "attrs": {
+        "volume": "0.1"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "ledRed",
+      "top": 420,
+      "left": 500,
+      "attrs": {
+        "color": "red"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "rRed",
+      "top": 420,
+      "left": 450,
+      "rotate": 90,
+      "attrs": {
+        "value": "220"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "ledGreen",
+      "top": 480,
+      "left": 500,
+      "attrs": {
+        "color": "green"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "rGreen",
+      "top": 480,
+      "left": 450,
+      "rotate": 90,
+      "attrs": {
+        "value": "220"
+      }
+    }
+  ],
+  "connections": [
+    ["esp32:3V3",   "bb1:tp.1",  "red",   []],
+    ["esp32:GND.1", "bb1:tn.1",  "black", []],
+    ["esp32:VIN",   "bb1:bp.1",  "red",   []],
+    ["esp32:GND.2", "bb1:bn.1",  "black", []],
+
+    ["bb1:tp.5",  "dht1:VCC", "red",   []],
+    ["bb1:tn.5",  "dht1:GND", "black", []],
+    ["esp32:D4",  "dht1:SDA", "green", []],
+
+    ["bb1:bp.5",  "mq2:VCC",  "red",   []],
+    ["bb1:bn.5",  "mq2:GND",  "black", []],
+    ["esp32:D34", "mq2:AO",   "green", []],
+
+    ["bb1:bp.10", "lcd1:VDD", "red",   []],
+    ["bb1:bn.10", "lcd1:VSS", "black", []],
+    ["bb1:bn.11", "lcd1:V0",  "black", []],
+    ["bb1:bn.12", "lcd1:RW",  "black", []],
+    ["bb1:bp.12", "lcd1:A",   "red",   []],
+    ["bb1:bn.13", "lcd1:K",   "black", []],
+
+    ["esp32:D23", "lcd1:RS", "green", []],
+    ["esp32:D22", "lcd1:E",  "green", []],
+    ["esp32:D21", "lcd1:D4", "green", []],
+    ["esp32:D17", "lcd1:D5", "green", []],
+    ["esp32:D16", "lcd1:D6", "green", []],
+    ["esp32:D15", "lcd1:D7", "green", []],
+
+    ["esp32:D5",  "buzzer1:1",     "green", []],
+    ["bb1:bn.15", "buzzer1:2",     "black", []],
+
+    ["esp32:D18", "rRed:1",        "green", []],
+    ["rRed:2",    "ledRed:A",      "green", []],
+    ["ledRed:C",  "bb1:bn.18",     "black", []],
+
+    ["esp32:D19", "rGreen:1",      "green", []],
+    ["rGreen:2",  "ledGreen:A",    "green", []],
+    ["ledGreen:C","bb1:bn.20",     "black", []]
+  ],
+  "dependencies": {}
+}

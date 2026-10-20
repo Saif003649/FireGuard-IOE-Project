@@ -1,0 +1,5 @@
+DHT sensor library for ESPx
+Adafruit Unified Sensor
+PubSubClient
+DHT sensor library
+LiquidCrystal
