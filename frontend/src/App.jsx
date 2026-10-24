@@ -73,17 +73,20 @@ function calcStats(arr, key) {
 // Status colour mapping
 // ---------------------------------------------------------------------------
 const STATUS_CONFIG = {
-  FIRE:             { label: "🔴 FIRE ALARM",        cls: "danger",     dot: "#dc2626" },
-  WARNING:          { label: "🟡 WARNING",            cls: "warning",    dot: "#d97706" },
-  SAFE:             { label: "🟢 SAFE",               cls: "safe",       dot: "#16a34a" },
-  SENSOR_ERROR:     { label: "⚠️ SENSOR ERROR",       cls: "danger",     dot: "#dc2626" },
-  WAITING_FOR_DEVICE: { label: "⏳ WAITING FOR DEVICE", cls: "neutral", dot: "#64748b" },
-  STARTING:         { label: "⏳ STARTING",            cls: "neutral",    dot: "#64748b" },
-  DISCONNECTED:     { label: "🔌 DISCONNECTED",        cls: "neutral",    dot: "#64748b" },
-  UNKNOWN:          { label: "❓ UNKNOWN",              cls: "neutral",    dot: "#64748b" },
+  FIRE:               { label: "🔴 FIRE ALARM",          cls: "danger",     dot: "#dc2626" },
+  WARNING:            { label: "🟡 WARNING",              cls: "warning",    dot: "#d97706" },
+  SAFE:               { label: "🟢 SAFE",                 cls: "safe",       dot: "#16a34a" },
+  SENSOR_ERROR:       { label: "⚠️ SENSOR ERROR",         cls: "danger",     dot: "#dc2626" },
+  WAITING_FOR_DEVICE: { label: "⏳ WAITING FOR DEVICE",   cls: "neutral",    dot: "#64748b" },
+  STARTING:           { label: "⏳ STARTING",              cls: "neutral",    dot: "#64748b" },
+  DISCONNECTED:       { label: "🔌 DISCONNECTED",          cls: "neutral",    dot: "#64748b" },
+  UNKNOWN:            { label: "❓ UNKNOWN",                cls: "neutral",    dot: "#64748b" },
 };
 
-function getStatusCfg(status) {
+function getStatusCfg(status, isStale) {
+  if (isStale) {
+    return { label: "⚠️ STALE TELEMETRY", cls: "warning", dot: "#d97706" };
+  }
   return STATUS_CONFIG[status] || STATUS_CONFIG.UNKNOWN;
 }
 
@@ -91,7 +94,7 @@ function getStatusCfg(status) {
 // Sub-components
 // ---------------------------------------------------------------------------
 
-function MetricCard({ title, value, unit, detail, highlight }) {
+function MetricCard({ title, value, unit, detail, highlight, isStale }) {
   return (
     <article className={`card${highlight ? " card--highlight" : ""}`}>
       <p className="card-title">{title}</p>
@@ -101,7 +104,9 @@ function MetricCard({ title, value, unit, detail, highlight }) {
           <span className="card-unit"> {unit}</span>
         ) : null}
       </strong>
-      <p className="muted">{detail}</p>
+      <p className="muted">
+        {isStale ? "⚠️ Telemetry is stale" : detail}
+      </p>
     </article>
   );
 }
@@ -116,7 +121,7 @@ function EmptyChart({ message }) {
 
 function SensorChart({ data, dataKey, color, label, unit, warningRef, fireRef }) {
   if (!data || data.length === 0) {
-    return <EmptyChart message={`No ${label} history yet — start the simulation.`} />;
+    return <EmptyChart message={`No ${label} history yet — start the Wokwi simulation.`} />;
   }
 
   const formatTick = (val) => {
@@ -243,25 +248,32 @@ function AnalysisPanel({ history }) {
 // ---------------------------------------------------------------------------
 export default function App() {
   const [data, setData] = useState({
-    device:      "ESP32-FIRE-01",
-    temperature: null,
-    humidity:    null,
-    smoke:       null,
-    status:      "WAITING_FOR_DEVICE",
-    wifi_rssi:   null,
-    uptime:      null,
-    lastUpdated: null,
+    device:                  "ESP32-FIRE-01",
+    temperature:             null,
+    humidity:                null,
+    smoke:                   null,
+    status:                  "WAITING_FOR_DEVICE",
+    wifi_rssi:               null,
+    uptime:                  null,
+    lastUpdated:             null,
+    deviceOnline:            false,
+    isStale:                 false,
+    secondsSinceLastReading: null,
   });
 
-  const [history, setHistory]         = useState([]);
+  const [history, setHistory]                 = useState([]);
   const [socketConnected, setSocketConnected] = useState(false);
-  const [mqttConnected,   setMqttConnected]   = useState(false);
-  const [mqttBroker,      setMqttBroker]      = useState("--");
+  const [mqttConnected, setMqttConnected]     = useState(false);
+  const [mqttBroker, setMqttBroker]           = useState("broker.hivemq.com");
+  const [mqttError, setMqttError]             = useState(null);
 
   // Keep history ref for appending without stale closures
   const historyRef = useRef([]);
 
   const appendHistory = useCallback((reading) => {
+    if (!reading || (reading.temperature === null && reading.humidity === null && reading.smoke === null)) {
+      return;
+    }
     historyRef.current = [...historyRef.current, { ...reading }];
     if (historyRef.current.length > MAX_CHART_POINTS) {
       historyRef.current = historyRef.current.slice(-MAX_CHART_POINTS);
@@ -270,7 +282,24 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // Fetch initial history from backend HTTP API
+    // 1. Fetch initial health and history from backend
+    fetch(`${BACKEND_URL}/api/health`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((health) => {
+        if (health && health.mqtt) {
+          setMqttConnected(Boolean(health.mqtt.connected));
+          if (health.mqtt.broker) {
+            setMqttBroker(health.mqtt.broker.replace(/^[a-z]+:\/\//, ""));
+          }
+          if (health.mqtt.lastError) {
+            setMqttError(health.mqtt.lastError);
+          }
+        }
+      })
+      .catch(() => {
+        // Backend sleeping or spinning up
+      });
+
     fetch(`${BACKEND_URL}/api/history?limit=${MAX_CHART_POINTS}`)
       .then((res) => (res.ok ? res.json() : null))
       .then((json) => {
@@ -284,43 +313,65 @@ export default function App() {
         }
       })
       .catch(() => {
-        // Backend not yet reachable or waking up; Socket.IO will handle updates
+        // Backend will deliver history via Socket.IO
       });
 
-    // Socket.IO events
-    socket.on("connect",    () => setSocketConnected(true));
-    socket.on("disconnect", () => {
+    // 2. Socket.IO event listeners
+    const handleConnect = () => {
+      setSocketConnected(true);
+    };
+
+    const handleDisconnect = () => {
       setSocketConnected(false);
       setMqttConnected(false);
-    });
+    };
 
-    socket.on("sensorData", (incoming) => {
-      setData(incoming);
+    const handleSensorData = (incoming) => {
+      setData((prev) => ({ ...prev, ...incoming }));
       appendHistory(incoming);
-    });
+    };
 
-    socket.on("mqttStatus", ({ connected, broker }) => {
-      setMqttConnected(connected);
-      if (broker) setMqttBroker(broker.replace("mqtt://", ""));
-    });
+    const handleMqttStatus = (payload) => {
+      setMqttConnected(Boolean(payload.connected));
+      if (payload.broker) {
+        setMqttBroker(payload.broker.replace(/^[a-z]+:\/\//, ""));
+      }
+      setMqttError(payload.error || null);
+    };
+
+    const handleDeviceStatus = (payload) => {
+      setData((prev) => ({
+        ...prev,
+        deviceOnline: Boolean(payload.online),
+        isStale: Boolean(payload.isStale),
+        status: payload.status || prev.status,
+      }));
+    };
+
+    socket.on("connect", handleConnect);
+    socket.on("disconnect", handleDisconnect);
+    socket.on("sensorData", handleSensorData);
+    socket.on("mqttStatus", handleMqttStatus);
+    socket.on("deviceStatus", handleDeviceStatus);
 
     return () => {
-      socket.off("connect");
-      socket.off("disconnect");
-      socket.off("sensorData");
-      socket.off("mqttStatus");
+      socket.off("connect", handleConnect);
+      socket.off("disconnect", handleDisconnect);
+      socket.off("sensorData", handleSensorData);
+      socket.off("mqttStatus", handleMqttStatus);
+      socket.off("deviceStatus", handleDeviceStatus);
     };
   }, [appendHistory]);
 
-  const statusCfg = getStatusCfg(data.status);
   const isFire    = data.status === "FIRE";
   const isWarning = data.status === "WARNING";
   const isError   = data.status === "SENSOR_ERROR";
   const isSafe    = data.status === "SAFE";
+  const statusCfg = getStatusCfg(data.status, data.isStale);
 
   return (
-    <main className={`dashboard${isFire ? " dashboard--fire" : ""}`}>
-      {/* ── Header ─────────────────────────────────────────────────── */}
+    <main className={`dashboard${isFire && !data.isStale ? " dashboard--fire" : ""}`}>
+      {/* ── Topbar Header ────────────────────────────────────────────── */}
       <header className="topbar">
         <div>
           <p className="eyebrow">INTERNET OF THINGS PROJECT</p>
@@ -331,26 +382,48 @@ export default function App() {
         </div>
 
         <div className="header-right">
-          {/* Status badge */}
+          {/* Main system status badge */}
           <span className={`status-badge status-badge--${statusCfg.cls}`}>
             {statusCfg.label}
           </span>
 
-          {/* Connection indicators */}
+          {/* Three decoupled connection indicators */}
           <div className="conn-indicators">
+            {/* 1. Backend Service Indicator */}
             <span className={`conn-pill ${socketConnected ? "conn-pill--on" : "conn-pill--off"}`}>
               <span className="conn-dot" />
-              Backend {socketConnected ? "connected" : "disconnected"}
+              Backend: {socketConnected ? "Online" : "Connecting..."}
             </span>
-            <span className={`conn-pill ${mqttConnected ? "conn-pill--on" : "conn-pill--off"}`}>
+
+            {/* 2. MQTT Broker Indicator */}
+            <span className={`conn-pill ${mqttConnected ? "conn-pill--on" : "conn-pill--danger"}`}>
               <span className="conn-dot" />
-              MQTT {mqttConnected ? "connected" : "disconnected"}
+              Broker: {mqttConnected ? "Connected" : "Disconnected"}
+            </span>
+
+            {/* 3. ESP32 Simulation Device Indicator */}
+            <span className={`conn-pill ${
+              !socketConnected || !mqttConnected ? "conn-pill--off" :
+              data.deviceOnline && !data.isStale ? "conn-pill--on" :
+              data.isStale ? "conn-pill--warn" :
+              "conn-pill--off"
+            }`}>
+              <span className="conn-dot" />
+              ESP32: {
+                !socketConnected ? "Waiting on backend" :
+                !mqttConnected ? "Broker offline" :
+                data.deviceOnline && !data.isStale ? "Live Streaming" :
+                data.isStale ? `Stale (${data.secondsSinceLastReading || ">15"}s)` :
+                data.lastUpdated ? "Offline" :
+                "Waiting for simulation"
+              }
             </span>
           </div>
 
-          {mqttBroker !== "--" && (
-            <p className="broker-label">Broker: {mqttBroker}</p>
-          )}
+          <p className="broker-label">
+            MQTT Broker: {mqttBroker}
+            {mqttError && !mqttConnected ? ` (${mqttError})` : ""}
+          </p>
         </div>
       </header>
 
@@ -358,6 +431,11 @@ export default function App() {
       <div className="device-strip">
         <span>Device: <strong>{data.device || "ESP32-FIRE-01"}</strong></span>
         <span>Last reading: <strong>{fmtDateTime(data.lastUpdated)}</strong></span>
+        <span>
+          Data state: <strong className={data.isStale ? "txt-warning" : data.deviceOnline ? "txt-safe" : "muted"}>
+            {data.isStale ? `STALE (${data.secondsSinceLastReading || ">15"}s ago)` : data.deviceOnline ? "LIVE STREAMING" : "WAITING FOR FIRST MESSAGE"}
+          </strong>
+        </span>
         {data.wifi_rssi !== null && (
           <span>Wi-Fi RSSI: <strong>{data.wifi_rssi} dBm</strong></span>
         )}
@@ -366,31 +444,51 @@ export default function App() {
         )}
       </div>
 
-      {/* ── Alert panel ────────────────────────────────────────────── */}
-      <section className={`panel alert-panel alert-panel--${statusCfg.cls}`}>
+      {/* ── Alert panel (Decoupled system diagnostics) ──────────────── */}
+      <section className={`panel alert-panel alert-panel--${
+        !socketConnected ? "neutral" :
+        !mqttConnected ? "danger" :
+        data.isStale ? "warning" :
+        statusCfg.cls
+      }`}>
         <div className="alert-dot-wrap">
           <span
-            className={`big-dot${isFire ? " big-dot--pulse" : ""}`}
-            style={{ background: statusCfg.dot }}
+            className={`big-dot${isFire && !data.isStale ? " big-dot--pulse" : ""}`}
+            style={{
+              background: !socketConnected ? "#94a3b8" :
+                          !mqttConnected ? "#ef4444" :
+                          data.isStale ? "#f59e0b" :
+                          statusCfg.dot
+            }}
           />
         </div>
         <div>
           <h2 className="alert-heading">
-            {isFire    && "🔴 Fire alarm condition detected!"}
-            {isWarning && "🟡 Warning — threshold exceeded"}
-            {isError   && "⚠️ Sensor error — check DHT22 connection"}
-            {isSafe    && "🟢 System safe — normal conditions"}
-            {!isFire && !isWarning && !isError && !isSafe &&
-              `${data.status.replaceAll("_", " ")} — waiting for device`}
+            {!socketConnected && "🔌 Backend Server Disconnected"}
+            {socketConnected && !mqttConnected && "⚠️ MQTT Broker Disconnected"}
+            {socketConnected && mqttConnected && !data.lastUpdated && "⏳ Waiting for ESP32 Simulation"}
+            {socketConnected && mqttConnected && data.isStale && "⚠️ Stale Sensor Telemetry"}
+            {socketConnected && mqttConnected && !data.isStale && isFire && "🔴 Fire Alarm Condition Detected!"}
+            {socketConnected && mqttConnected && !data.isStale && isWarning && "🟡 Warning — Threshold Exceeded"}
+            {socketConnected && mqttConnected && !data.isStale && isError && "⚠️ Sensor Error — Check DHT22 Connection"}
+            {socketConnected && mqttConnected && !data.isStale && isSafe && "🟢 System Safe — Normal Conditions"}
           </h2>
           <p className="muted">
-            {!socketConnected
-              ? "Not connected to backend. Is the Node.js server running?"
-              : !mqttConnected
-              ? "Backend running but MQTT broker not connected yet."
-              : data.lastUpdated
-              ? `Readings are live. Last update: ${fmtDateTime(data.lastUpdated)}`
-              : "Backend connected — waiting for first reading from ESP32."}
+            {!socketConnected && (
+              "Cannot reach Render backend. If Render was asleep on the free tier, it takes 30–50 seconds to boot up."
+            )}
+            {socketConnected && !mqttConnected && (
+              `Backend is online, but disconnected from MQTT broker (${mqttBroker}). The backend is automatically reconnecting.`
+            )}
+            {socketConnected && mqttConnected && !data.lastUpdated && (
+              "Backend and MQTT broker are connected. Start the Wokwi ESP32 simulation to begin receiving live readings."
+            )}
+            {socketConnected && mqttConnected && data.isStale && (
+              `Last sensor reading was received ${data.secondsSinceLastReading ? data.secondsSinceLastReading + " seconds" : "over 15s"} ago. Check if Wokwi simulation was paused or stopped.`
+            )}
+            {socketConnected && mqttConnected && !data.isStale && data.lastUpdated && (
+              `Live streaming active. Reading timestamp: ${fmtDateTime(data.lastUpdated)}.`
+            )}
           </p>
         </div>
       </section>
@@ -401,14 +499,16 @@ export default function App() {
           title="Temperature"
           value={data.temperature !== null ? fmt(data.temperature) : null}
           unit="°C"
-          detail="DHT22 sensor"
+          detail="DHT22 temperature sensor"
           highlight={data.temperature >= 40}
+          isStale={data.isStale}
         />
         <MetricCard
           title="Humidity"
           value={data.humidity !== null ? fmt(data.humidity) : null}
           unit="%"
-          detail="Relative humidity"
+          detail="DHT22 relative humidity"
+          isStale={data.isStale}
         />
         <MetricCard
           title="Smoke / Gas ADC"
@@ -416,12 +516,14 @@ export default function App() {
           unit=""
           detail="MQ-2 raw ADC (0–4095)"
           highlight={data.smoke >= 2800}
+          isStale={data.isStale}
         />
         <MetricCard
           title="Wi-Fi Signal"
           value={data.wifi_rssi !== null ? String(data.wifi_rssi) : null}
           unit="dBm"
           detail="ESP32 signal strength"
+          isStale={data.isStale}
         />
       </section>
 
@@ -429,9 +531,9 @@ export default function App() {
       <section className="charts-section">
         <h2>Live History Charts</h2>
         <p className="muted chart-note">
-          Charts update automatically when new readings arrive from MQTT.
+          Charts update automatically as MQTT sensor readings arrive.
           Showing up to {MAX_CHART_POINTS} most recent readings.
-          {history.length === 0 && " Start the Wokwi simulation to begin collecting data."}
+          {history.length === 0 && " Start the Wokwi simulation to collect real data."}
         </p>
 
         <div className="charts-grid">
@@ -482,18 +584,20 @@ export default function App() {
         <h2>System Information</h2>
         <div className="details-grid">
           <p><span className="detail-label">Device ID</span> ESP32-FIRE-01</p>
-          <p><span className="detail-label">Transport</span> MQTT over TCP</p>
-          <p><span className="detail-label">Real-time</span> Socket.IO</p>
-          <p><span className="detail-label">Data source</span> Wokwi simulation</p>
-          <p><span className="detail-label">MQTT broker</span> {mqttBroker}</p>
-          <p><span className="detail-label">Data topic</span> fireguard/demo01/data</p>
-          <p><span className="detail-label">Status topic</span> fireguard/demo01/status</p>
-          <p><span className="detail-label">Readings</span> {history.length} collected</p>
+          <p><span className="detail-label">Hardware Transport</span> MQTT over TCP (Port 1883)</p>
+          <p><span className="detail-label">Dashboard Transport</span> Socket.IO &amp; REST</p>
+          <p><span className="detail-label">Data Source</span> Wokwi ESP32 simulation</p>
+          <p><span className="detail-label">MQTT Broker</span> {mqttBroker}</p>
+          <p><span className="detail-label">Data Topic</span> fireguard/demo01/data</p>
+          <p><span className="detail-label">Status Topic</span> fireguard/demo01/status</p>
+          <p><span className="detail-label">Backend Status</span> {socketConnected ? "Online (Socket.IO)" : "Offline"}</p>
+          <p><span className="detail-label">Broker Status</span> {mqttConnected ? "Connected" : "Disconnected"}</p>
+          <p><span className="detail-label">Readings Collected</span> {history.length} samples</p>
         </div>
       </section>
 
       <footer>
-        FireGuard · Academic simulation only · Data resets on backend restart
+        FireGuard · Smart Fire Detection and Monitoring System · Academic IoT Simulation
       </footer>
     </main>
   );

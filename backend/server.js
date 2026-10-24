@@ -12,16 +12,36 @@ const http      = require("http");
 const { Server } = require("socket.io");
 
 // -------------------------------------------------------
-// Configuration — override with environment variables
+// Configuration & Helpers
 // -------------------------------------------------------
-const PORT      = process.env.PORT      || 5000;
-const MQTT_URL  = process.env.MQTT_URL  || "mqtt://broker.hivemq.com";
-const MAX_HISTORY = parseInt(process.env.MAX_HISTORY || "300", 10);
-const FRONTEND_URL = process.env.FRONTEND_URL ? process.env.FRONTEND_URL.replace(/\/+$/, "") : null;
+const PORT         = process.env.PORT || 5000;
+const MAX_HISTORY  = parseInt(process.env.MAX_HISTORY || "300", 10);
+const FRONTEND_URL = process.env.FRONTEND_URL ? process.env.FRONTEND_URL.trim().replace(/\/+$/, "") : null;
 
 // Topic names — must match sketch.ino exactly
 const DATA_TOPIC   = "fireguard/demo01/data";
 const STATUS_TOPIC = "fireguard/demo01/status";
+
+// Time before sensor data is flagged as STALE (ESP32 transmits every 2 seconds)
+const STALE_THRESHOLD_MS = 15000; // 15 seconds
+
+/**
+ * Normalizes user-supplied MQTT URLs from environment variables.
+ * Handles missing protocol, extra quotes, whitespace, and port defaults.
+ */
+function normalizeMqttUrl(rawUrl) {
+  let url = (rawUrl || "mqtt://broker.hivemq.com").trim();
+  url = url.replace(/^["']+|["']+$/g, "").trim();
+
+  // If protocol is missing (e.g., "broker.hivemq.com" or "broker.hivemq.com:1883")
+  if (!url.includes("://")) {
+    url = `mqtt://${url}`;
+  }
+  return url;
+}
+
+const RAW_MQTT_URL = process.env.MQTT_URL || "mqtt://broker.hivemq.com";
+const MQTT_URL     = normalizeMqttUrl(RAW_MQTT_URL);
 
 // -------------------------------------------------------
 // Express + Socket.IO setup
@@ -61,149 +81,233 @@ app.use(express.json());
 // Application state
 // -------------------------------------------------------
 
-/** The most recent validated sensor reading. */
+/** The most recent sensor reading. */
 let latestData = {
-  device:      "ESP32-FIRE-01",
-  temperature: null,
-  humidity:    null,
-  smoke:       null,
-  status:      "WAITING_FOR_DEVICE",
-  wifi_rssi:   null,
-  uptime:      null,
-  lastUpdated: null
+  device:       "ESP32-FIRE-01",
+  temperature:  null,
+  humidity:     null,
+  smoke:        null,
+  status:       "WAITING_FOR_DEVICE",
+  wifi_rssi:    null,
+  uptime:       null,
+  lastUpdated:  null
 };
 
-/**
- * Bounded history array.
- * Oldest readings are discarded when MAX_HISTORY is reached.
- * NOTE: This resets when the backend restarts. Add MongoDB for
- * persistence (see README for optional upgrade instructions).
- */
+/** Bounded in-memory history array. */
 const sensorHistory = [];
 
-/** Tracks MQTT connection state honestly. */
+/** MQTT connection telemetry. */
 let mqttConnected   = false;
-let mqttBrokerUrl   = MQTT_URL;
+let mqttLastError   = null;
 let mqttConnectTime = null;
 
-// -------------------------------------------------------
-// History helpers
-// -------------------------------------------------------
+/** Device presence and freshness telemetry. */
+let lastDevicePing  = null;
+let deviceOnline    = false;
+
 function addToHistory(reading) {
   sensorHistory.push(reading);
   if (sensorHistory.length > MAX_HISTORY) {
-    sensorHistory.shift(); // Remove oldest entry
+    sensorHistory.shift();
   }
 }
 
+/**
+ * Returns current sensor reading enriched with real-time freshness telemetry.
+ */
+function getEnrichedData() {
+  const now = Date.now();
+  const isStale = lastDevicePing ? (now - lastDevicePing > STALE_THRESHOLD_MS) : true;
+  const isOnline = Boolean(deviceOnline && !isStale);
+
+  return {
+    ...latestData,
+    deviceOnline: isOnline,
+    isStale: isStale && latestData.lastUpdated !== null,
+    secondsSinceLastReading: lastDevicePing ? Math.round((now - lastDevicePing) / 1000) : null
+  };
+}
+
 // -------------------------------------------------------
-// MQTT setup
+// MQTT client setup & lifecycle handlers
 // -------------------------------------------------------
-console.log(`[MQTT] Connecting to ${MQTT_URL} ...`);
+console.log(`[MQTT] Initializing client connection to: ${MQTT_URL}`);
 
 const mqttClient = mqtt.connect(MQTT_URL, {
   clientId:        `fireguard-backend-${Math.random().toString(16).slice(2, 8)}`,
-  reconnectPeriod: 5000,   // retry every 5 s
-  connectTimeout:  15000   // give up after 15 s per attempt
+  clean:           true,
+  reconnectPeriod: 4000,   // retry every 4 seconds on disconnect
+  connectTimeout:  15000,  // 15 seconds per connection attempt
+  keepalive:       30,
+  family:          4       // Force IPv4 lookup for cloud container stability
 });
 
 mqttClient.on("connect", () => {
   mqttConnected   = true;
+  mqttLastError   = null;
   mqttConnectTime = new Date().toISOString();
-  console.log(`[MQTT] Connected to ${MQTT_URL}`);
+  console.log(`[MQTT] Successfully connected to broker: ${MQTT_URL}`);
 
-  mqttClient.subscribe([DATA_TOPIC, STATUS_TOPIC], (err) => {
+  mqttClient.subscribe([DATA_TOPIC, STATUS_TOPIC], { qos: 0 }, (err, granted) => {
     if (err) {
-      console.error("[MQTT] Subscription failed:", err.message);
+      console.error(`[MQTT] Subscription error on [${DATA_TOPIC}, ${STATUS_TOPIC}]:`, err.message);
     } else {
-      console.log(`[MQTT] Subscribed to "${DATA_TOPIC}" and "${STATUS_TOPIC}"`);
+      console.log(`[MQTT] Subscribed to FireGuard topics:`);
+      granted.forEach((g) => console.log(`   - Topic: "${g.topic}" (QoS ${g.qos})`));
     }
   });
 
-  // Tell connected dashboards that MQTT came up
-  io.emit("mqttStatus", { connected: true, broker: MQTT_URL });
+  io.emit("mqttStatus", {
+    connected:   true,
+    broker:      MQTT_URL,
+    status:      "connected",
+    error:       null,
+    connectedAt: mqttConnectTime
+  });
 });
 
 mqttClient.on("reconnect", () => {
-  console.log("[MQTT] Reconnecting...");
+  console.log(`[MQTT] Attempting reconnection to broker: ${MQTT_URL} ...`);
   mqttConnected = false;
-  io.emit("mqttStatus", { connected: false, broker: MQTT_URL });
+  io.emit("mqttStatus", {
+    connected: false,
+    broker:    MQTT_URL,
+    status:    "reconnecting",
+    error:     mqttLastError
+  });
 });
 
 mqttClient.on("offline", () => {
   mqttConnected = false;
-  console.log("[MQTT] Client offline.");
-  io.emit("mqttStatus", { connected: false, broker: MQTT_URL });
+  console.warn(`[MQTT] Client went offline from broker: ${MQTT_URL}`);
+  io.emit("mqttStatus", {
+    connected: false,
+    broker:    MQTT_URL,
+    status:    "offline",
+    error:     mqttLastError
+  });
 });
 
 mqttClient.on("error", (err) => {
   mqttConnected = false;
-  console.error("[MQTT] Error:", err.message);
-  io.emit("mqttStatus", { connected: false, broker: MQTT_URL, error: err.message });
+  mqttLastError = err ? (err.message || String(err)) : "Unknown MQTT error";
+  console.error(`[MQTT] Connection error on ${MQTT_URL}:`, mqttLastError);
+  io.emit("mqttStatus", {
+    connected: false,
+    broker:    MQTT_URL,
+    status:    "error",
+    error:     mqttLastError
+  });
 });
 
 mqttClient.on("close", () => {
+  if (mqttConnected) {
+    console.log(`[MQTT] Broker connection closed.`);
+  }
   mqttConnected = false;
-  console.log("[MQTT] Connection closed.");
 });
 
 // -------------------------------------------------------
-// Handle incoming MQTT messages
+// Incoming MQTT message dispatcher & validator
 // -------------------------------------------------------
 mqttClient.on("message", (topic, message) => {
   const raw = message.toString().trim();
-  console.log(`[MQTT] Message on "${topic}": ${raw.substring(0, 120)}`);
 
+  // 1. Device status topic
+  if (topic === STATUS_TOPIC) {
+    lastDevicePing = Date.now();
+    console.log(`[Status Topic] Received: "${raw}"`);
+
+    if (raw === "ONLINE") {
+      deviceOnline = true;
+    } else if (raw === "OFFLINE") {
+      deviceOnline = false;
+    } else {
+      // Direct state message like "SAFE", "WARNING", "FIRE", "SENSOR_ERROR"
+      deviceOnline = true;
+      latestData.status = raw;
+    }
+
+    const enriched = getEnrichedData();
+    io.emit("deviceStatus", {
+      online:    enriched.deviceOnline,
+      rawStatus: raw,
+      status:    latestData.status,
+      lastSeen:  new Date(lastDevicePing).toISOString()
+    });
+    io.emit("sensorData", enriched);
+    return;
+  }
+
+  // 2. Sensor data topic
   if (topic === DATA_TOPIC) {
-    // Validate JSON
     let sensor;
     try {
       sensor = JSON.parse(raw);
     } catch (parseErr) {
-      console.error("[MQTT] Malformed JSON, ignoring:", parseErr.message);
+      console.error(`[MQTT] Malformed JSON on "${topic}":`, parseErr.message, "Payload:", raw);
       return;
     }
 
-    // Basic field validation
-    const t = typeof sensor.temperature === "number" ? sensor.temperature : null;
-    const h = typeof sensor.humidity    === "number" ? sensor.humidity    : null;
-    const s = typeof sensor.smoke       === "number" ? sensor.smoke       : null;
+    // Validate sensor numbers
+    const temp  = (typeof sensor.temperature === "number" && !isNaN(sensor.temperature)) ? sensor.temperature : null;
+    const hum   = (typeof sensor.humidity === "number" && !isNaN(sensor.humidity)) ? sensor.humidity : null;
+    const smoke = (typeof sensor.smoke === "number" && !isNaN(sensor.smoke)) ? Math.round(sensor.smoke) : null;
 
-    if (t === null && h === null && s === null) {
-      console.warn("[MQTT] Received payload with no valid numeric sensor fields.");
+    if (temp === null && hum === null && smoke === null) {
+      console.warn(`[MQTT] Payload ignored — no valid numeric sensor fields:`, raw);
       return;
     }
+
+    lastDevicePing = Date.now();
+    deviceOnline   = true;
+
+    const statusVal = (typeof sensor.status === "string" && sensor.status.trim().length > 0)
+      ? sensor.status.trim()
+      : (latestData.status || "UNKNOWN");
 
     const enriched = {
-      device:      sensor.device    || latestData.device,
-      temperature: t,
-      humidity:    h,
-      smoke:       s,
-      status:      typeof sensor.status === "string" ? sensor.status : "UNKNOWN",
-      wifi_rssi:   typeof sensor.wifi_rssi === "number" ? sensor.wifi_rssi : null,
-      uptime:      typeof sensor.uptime    === "number" ? sensor.uptime    : null,
-      lastUpdated: new Date().toISOString()
+      device:       typeof sensor.device === "string" ? sensor.device : latestData.device,
+      temperature:  temp,
+      humidity:     hum,
+      smoke:        smoke,
+      status:       statusVal,
+      wifi_rssi:    (typeof sensor.wifi_rssi === "number" && !isNaN(sensor.wifi_rssi)) ? sensor.wifi_rssi : null,
+      uptime:       (typeof sensor.uptime === "number" && !isNaN(sensor.uptime)) ? sensor.uptime : null,
+      deviceOnline: true,
+      lastUpdated:  new Date().toISOString()
     };
 
     latestData = enriched;
     addToHistory({ ...enriched });
 
-    // Broadcast to all connected dashboards
-    io.emit("sensorData", latestData);
-  }
-
-  if (topic === STATUS_TOPIC) {
-    // Status messages are plain strings like "ONLINE", "FIRE", "SAFE"
-    io.emit("deviceStatus", raw);
-    console.log(`[Status] Device reported: ${raw}`);
+    const clientPayload = getEnrichedData();
+    io.emit("sensorData", clientPayload);
+    console.log(`[Sensor Data] ${enriched.device}: T=${temp}°C, H=${hum}%, Smoke=${smoke}, Status=${statusVal}`);
   }
 });
 
+// Periodic heartbeat: detect device silence and mark data as stale
+setInterval(() => {
+  if (lastDevicePing && (Date.now() - lastDevicePing > STALE_THRESHOLD_MS) && deviceOnline) {
+    deviceOnline = false;
+    const staleData = getEnrichedData();
+    io.emit("sensorData", staleData);
+    io.emit("deviceStatus", {
+      online:   false,
+      status:   latestData.status,
+      isStale:  true,
+      lastSeen: new Date(lastDevicePing).toISOString()
+    });
+    console.log(`[Heartbeat] Device inactive for >${STALE_THRESHOLD_MS / 1000}s. Marked as STALE/OFFLINE.`);
+  }
+}, 5000);
+
 // -------------------------------------------------------
-// REST API
+// REST API Endpoints
 // -------------------------------------------------------
 
-/** GET / — Health check */
+/** GET / — Root service check */
 app.get("/", (req, res) => {
   res.json({
     service:   "FireGuard Backend",
@@ -212,35 +316,40 @@ app.get("/", (req, res) => {
   });
 });
 
-/** GET /api/health — Detailed backend and MQTT health */
+/** GET /api/health — Full telemetry (backend, broker, device status) */
 app.get("/api/health", (req, res) => {
+  const enriched = getEnrichedData();
   res.json({
-    backend:        "running",
+    backend: "running",
     mqtt: {
-      connected:    mqttConnected,
-      broker:       mqttBrokerUrl,
-      connectedAt:  mqttConnectTime
+      connected:   mqttConnected,
+      broker:      MQTT_URL,
+      connectedAt: mqttConnectTime,
+      lastError:   mqttLastError
     },
-    historyCount:   sensorHistory.length,
-    maxHistory:     MAX_HISTORY,
-    latestStatus:   latestData.status,
-    timestamp:      new Date().toISOString()
+    device: {
+      id:                      latestData.device,
+      online:                  enriched.deviceOnline,
+      isStale:                 enriched.isStale,
+      secondsSinceLastReading: enriched.secondsSinceLastReading,
+      lastSeen:                lastDevicePing ? new Date(lastDevicePing).toISOString() : null,
+      currentStatus:           latestData.status
+    },
+    historyCount: sensorHistory.length,
+    maxHistory:   MAX_HISTORY,
+    timestamp:    new Date().toISOString()
   });
 });
 
-/** GET /api/data — Latest sensor reading */
+/** GET /api/data — Latest received sensor reading */
 app.get("/api/data", (req, res) => {
-  res.json(latestData);
+  res.json(getEnrichedData());
 });
 
-/**
- * GET /api/history — Historical readings
- * Query params:
- *   ?limit=N   — return only the last N readings (default: all)
- */
+/** GET /api/history — Historical readings with ?limit=N support */
 app.get("/api/history", (req, res) => {
   const limitParam = parseInt(req.query.limit, 10);
-  const limit = !isNaN(limitParam) && limitParam > 0 ? limitParam : sensorHistory.length;
+  const limit = (!isNaN(limitParam) && limitParam > 0) ? limitParam : sensorHistory.length;
   const result = sensorHistory.slice(-limit);
   res.json({
     count:    result.length,
@@ -251,21 +360,36 @@ app.get("/api/history", (req, res) => {
 
 // 404 fallback
 app.use((req, res) => {
-  res.status(404).json({ error: "Not found" });
+  res.status(404).json({ error: "Endpoint not found" });
 });
 
 // -------------------------------------------------------
-// Socket.IO connection
+// Socket.IO lifecycle
 // -------------------------------------------------------
 io.on("connection", (socket) => {
-  console.log(`[Socket.IO] Dashboard connected: ${socket.id}`);
+  console.log(`[Socket.IO] Client connected: ${socket.id}`);
 
-  // Send current state immediately upon connection
-  socket.emit("sensorData",  latestData);
-  socket.emit("mqttStatus",  { connected: mqttConnected, broker: MQTT_URL });
+  // Send current telemetry immediately upon connection
+  socket.emit("mqttStatus", {
+    connected:   mqttConnected,
+    broker:      MQTT_URL,
+    status:      mqttConnected ? "connected" : "disconnected",
+    error:       mqttLastError,
+    connectedAt: mqttConnectTime
+  });
+
+  const enriched = getEnrichedData();
+  socket.emit("sensorData", enriched);
+
+  socket.emit("deviceStatus", {
+    online:   enriched.deviceOnline,
+    status:   latestData.status,
+    isStale:  enriched.isStale,
+    lastSeen: lastDevicePing ? new Date(lastDevicePing).toISOString() : null
+  });
 
   socket.on("disconnect", () => {
-    console.log(`[Socket.IO] Dashboard disconnected: ${socket.id}`);
+    console.log(`[Socket.IO] Client disconnected: ${socket.id}`);
   });
 });
 
@@ -277,6 +401,8 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("  FireGuard Backend");
   console.log(`  Listening on port ${PORT} (0.0.0.0)`);
   console.log(`  MQTT broker  : ${MQTT_URL}`);
+  console.log(`  Data topic   : ${DATA_TOPIC}`);
+  console.log(`  Status topic : ${STATUS_TOPIC}`);
   console.log(`  Max history  : ${MAX_HISTORY} readings`);
   if (FRONTEND_URL) {
     console.log(`  CORS allowed : ${FRONTEND_URL}`);
