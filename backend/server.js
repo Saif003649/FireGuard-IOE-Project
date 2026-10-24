@@ -17,6 +17,7 @@ const { Server } = require("socket.io");
 const PORT      = process.env.PORT      || 5000;
 const MQTT_URL  = process.env.MQTT_URL  || "mqtt://broker.hivemq.com";
 const MAX_HISTORY = parseInt(process.env.MAX_HISTORY || "300", 10);
+const FRONTEND_URL = process.env.FRONTEND_URL ? process.env.FRONTEND_URL.replace(/\/+$/, "") : null;
 
 // Topic names — must match sketch.ino exactly
 const DATA_TOPIC   = "fireguard/demo01/data";
@@ -27,14 +28,33 @@ const STATUS_TOPIC = "fireguard/demo01/status";
 // -------------------------------------------------------
 const app    = express();
 const server = http.createServer(app);
-const io     = new Server(server, {
+
+// Dynamically allow Vercel domains, localhost, or any configured origin
+const allowedOriginCheck = (origin, callback) => {
+  if (!origin) return callback(null, true);
+  if (
+    origin.includes("localhost") ||
+    origin.includes("127.0.0.1") ||
+    origin.endsWith(".vercel.app") ||
+    (FRONTEND_URL && origin.startsWith(FRONTEND_URL))
+  ) {
+    return callback(null, true);
+  }
+  return callback(null, true);
+};
+
+const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
   }
 });
 
-app.use(cors());
+app.use(cors({
+  origin: allowedOriginCheck,
+  methods: ["GET", "POST", "OPTIONS"],
+  credentials: true
+}));
 app.use(express.json());
 
 // -------------------------------------------------------
@@ -252,12 +272,15 @@ io.on("connection", (socket) => {
 // -------------------------------------------------------
 // Start server
 // -------------------------------------------------------
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log("================================================");
   console.log("  FireGuard Backend");
-  console.log(`  Listening on http://localhost:${PORT}`);
+  console.log(`  Listening on port ${PORT} (0.0.0.0)`);
   console.log(`  MQTT broker  : ${MQTT_URL}`);
   console.log(`  Max history  : ${MAX_HISTORY} readings`);
+  if (FRONTEND_URL) {
+    console.log(`  CORS allowed : ${FRONTEND_URL}`);
+  }
   console.log("================================================");
   console.log("  Endpoints:");
   console.log(`    GET http://localhost:${PORT}/`);

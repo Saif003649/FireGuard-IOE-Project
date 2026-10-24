@@ -13,10 +13,11 @@ import {
 import "./index.css";
 
 // ---------------------------------------------------------------------------
-// Backend URL — set VITE_BACKEND_URL in frontend/.env for production
+// Backend URL — set VITE_BACKEND_URL in frontend/.env or Vercel settings
 // ---------------------------------------------------------------------------
-const BACKEND_URL =
+const rawBackendUrl =
   import.meta.env.VITE_BACKEND_URL || "http://localhost:5000";
+const BACKEND_URL = rawBackendUrl.replace(/\/+$/, "");
 
 // Maximum chart points retained in the browser (independent of backend)
 const MAX_CHART_POINTS = 100;
@@ -24,7 +25,10 @@ const MAX_CHART_POINTS = 100;
 // ---------------------------------------------------------------------------
 // Socket instance (module-level so it survives re-renders)
 // ---------------------------------------------------------------------------
-const socket = io(BACKEND_URL, { autoConnect: true });
+const socket = io(BACKEND_URL, {
+  autoConnect: true,
+  transports: ["websocket", "polling"],
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -266,6 +270,23 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // Fetch initial history from backend HTTP API
+    fetch(`${BACKEND_URL}/api/history?limit=${MAX_CHART_POINTS}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((json) => {
+        if (json && Array.isArray(json.readings) && json.readings.length > 0) {
+          historyRef.current = json.readings.slice(-MAX_CHART_POINTS);
+          setHistory([...historyRef.current]);
+          const latest = json.readings[json.readings.length - 1];
+          if (latest) {
+            setData((prev) => ({ ...prev, ...latest }));
+          }
+        }
+      })
+      .catch(() => {
+        // Backend not yet reachable or waking up; Socket.IO will handle updates
+      });
+
     // Socket.IO events
     socket.on("connect",    () => setSocketConnected(true));
     socket.on("disconnect", () => {

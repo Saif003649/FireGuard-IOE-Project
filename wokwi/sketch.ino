@@ -58,15 +58,16 @@ const int   SMOKE_WARNING = 2800;   // Raw ADC (≈ medium smoke)
 const int   SMOKE_FIRE    = 3500;   // Raw ADC (≈ heavy smoke)
 
 // --- Timing ---
-const unsigned long READ_INTERVAL      = 2000;  // ms between sensor reads
-const unsigned long RECONNECT_INTERVAL = 8000;  // ms between reconnect tries
-const unsigned long WIFI_TIMEOUT       = 20000; // ms to wait for WiFi
+const unsigned long READ_INTERVAL        = 2000;  // ms between sensor reads
+const unsigned long RECONNECT_INTERVAL   = 10000; // ms between reconnect tries
+const unsigned long WIFI_INITIAL_TIMEOUT = 8000;  // ms max initial wait in setup()
 
 WiFiClient   wifiClient;
 PubSubClient mqttClient(wifiClient);
 
 unsigned long lastRead      = 0;
-unsigned long lastReconnect = 0;
+unsigned long lastWifiRetry = 0;
+unsigned long lastMqttRetry = 0;
 unsigned long bootTime      = 0;
 
 String currentStatus = "STARTING";
@@ -115,38 +116,35 @@ void setOutputs(const String& status) {
 }
 
 // -------------------------------------------------------
-// connectWiFi — non-blocking friendly version.
-// Blocks for up to WIFI_TIMEOUT ms on first call,
-// then returns immediately if already connected.
+// connectWiFi — friendly connection handler.
+// In setup (initialWait=true), gives a brief blocking window.
+// In loop (initialWait=false), requests background reconnect
+// without stalling sensor sampling or local alarm response.
 // -------------------------------------------------------
-void connectWiFi() {
+void connectWiFi(bool initialWait = false) {
   if (WiFi.status() == WL_CONNECTED) return;
 
   Serial.println("[WiFi] Connecting to Wokwi-GUEST...");
-  printLCDLine(0, "Connecting WiFi");
-  printLCDLine(1, "Please wait...");
-
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD, 6);  // channel 6 for Wokwi
 
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT) {
-    delay(500);
-    Serial.print('.');
+  if (initialWait) {
+    printLCDLine(0, "Connecting WiFi");
+    printLCDLine(1, "Please wait...");
+
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+      delay(300);
+      Serial.print('.');
+    }
+    Serial.println();
   }
-  Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("[WiFi] Connected. IP: ");
+    Serial.print("[WiFi] Connected! IP: ");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("[WiFi] Connection failed after timeout.");
-    Serial.print("[WiFi] Status code: ");
-    Serial.println(WiFi.status());
-    Serial.println("[WiFi] NOTE: In Wokwi, 'IoT Gateway failed' means the");
-    Serial.println("[WiFi]       Wokwi gateway is busy/unavailable — this is");
-    Serial.println("[WiFi]       a Wokwi infrastructure issue, not a code bug.");
-    Serial.println("[WiFi]       Try restarting the simulation.");
+    Serial.println("[WiFi] Not yet connected (will continue retrying in background).");
   }
 }
 
@@ -166,18 +164,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 // -------------------------------------------------------
-// connectMQTT — attempts one connection only; caller
-// is responsible for rate-limiting via lastReconnect.
+// connectMQTT — attempts one connection with a 100% unique ID
 // -------------------------------------------------------
 void connectMQTT() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (mqttClient.connected())        return;
 
-  // Build a unique client ID using part of the chip MAC
-  String clientId = "FireGuard-";
-  clientId += String(DEVICE_ID);
-  clientId += "-";
-  clientId += String((uint32_t)(ESP.getEfuseMac() & 0xFFFFFF), HEX);
+  // Build a unique client ID using random suffix to prevent broker disconnects
+  String clientId = "FireGuard-ESP32-";
+  clientId += String(random(100000, 999999), HEX);
+  clientId += String(millis() % 10000);
 
   Serial.print("[MQTT] Connecting to ");
   Serial.print(MQTT_SERVER);
@@ -186,10 +182,9 @@ void connectMQTT() {
   Serial.print(" as ");
   Serial.println(clientId);
 
+  // Standard 5-arg connect without null credentials
   bool ok = mqttClient.connect(
     clientId.c_str(),
-    nullptr,        // username (none for public broker)
-    nullptr,        // password
     TOPIC_STATUS,   // will topic
     0,              // will QoS
     true,           // will retain
@@ -197,18 +192,25 @@ void connectMQTT() {
   );
 
   if (ok) {
-    Serial.println("[MQTT] Connected.");
+    Serial.println("[MQTT] Connected successfully!");
     // Announce online status with retain so the backend sees it on reconnect
     mqttClient.publish(TOPIC_STATUS, "ONLINE", true);
   } else {
+    int state = mqttClient.state();
     Serial.print("[MQTT] Connection failed. State code: ");
-    Serial.println(mqttClient.state());
-    // State codes:
-    // -4 = timeout,  -3 = connection refused (server unavailable)
-    // -2 = connection lost, -1 = disconnected, 0 = connected
-    // 1 = bad protocol, 2 = bad client ID, 3 = server unavailable
-    // 4 = bad credentials, 5 = not authorized
-    Serial.println("[MQTT] Check that broker.hivemq.com is reachable from Wokwi.");
+    Serial.println(state);
+    switch (state) {
+      case -4: Serial.println("  -> MQTT_CONNECTION_TIMEOUT (Broker timed out)"); break;
+      case -3: Serial.println("  -> MQTT_CONNECTION_LOST (Broker refused connection)"); break;
+      case -2: Serial.println("  -> MQTT_CONNECT_FAILED (Network error or duplicate client ID)"); break;
+      case -1: Serial.println("  -> MQTT_DISCONNECTED"); break;
+      case 1:  Serial.println("  -> MQTT_CONNECT_BAD_PROTOCOL"); break;
+      case 2:  Serial.println("  -> MQTT_CONNECT_BAD_CLIENT_ID"); break;
+      case 3:  Serial.println("  -> MQTT_CONNECT_UNAVAILABLE"); break;
+      case 4:  Serial.println("  -> MQTT_CONNECT_BAD_CREDENTIALS"); break;
+      case 5:  Serial.println("  -> MQTT_CONNECT_UNAUTHORIZED"); break;
+      default: Serial.println("  -> Unknown error"); break;
+    }
   }
 }
 
@@ -282,7 +284,7 @@ void setup() {
   Serial.print("  Status topic: "); Serial.println(TOPIC_STATUS);
   Serial.println("================================================");
 
-  connectWiFi();
+  connectWiFi(true);
 
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
@@ -302,19 +304,19 @@ void setup() {
 // loop
 // ============================================================
 void loop() {
-  // --- WiFi reconnect (rate-limited) ---
+  // --- WiFi reconnect (non-blocking, rate-limited) ---
   if (WiFi.status() != WL_CONNECTED &&
-      millis() - lastReconnect >= RECONNECT_INTERVAL) {
-    lastReconnect = millis();
-    Serial.println("[WiFi] Disconnected — attempting reconnect...");
-    connectWiFi();
+      millis() - lastWifiRetry >= RECONNECT_INTERVAL) {
+    lastWifiRetry = millis();
+    Serial.println("[WiFi] Disconnected — triggering background reconnect...");
+    connectWiFi(false);
   }
 
   // --- MQTT reconnect (rate-limited, only when WiFi is up) ---
   if (WiFi.status() == WL_CONNECTED &&
       !mqttClient.connected() &&
-      millis() - lastReconnect >= RECONNECT_INTERVAL) {
-    lastReconnect = millis();
+      millis() - lastMqttRetry >= RECONNECT_INTERVAL) {
+    lastMqttRetry = millis();
     connectMQTT();
   }
 

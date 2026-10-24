@@ -1,5 +1,4 @@
-DHT sensor library for ESPx
+DHT sensor library
 Adafruit Unified Sensor
 PubSubClient
-DHT sensor library
 LiquidCrystal
