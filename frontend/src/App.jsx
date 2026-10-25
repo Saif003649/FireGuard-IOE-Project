@@ -17,7 +17,7 @@ import "./index.css";
 // ---------------------------------------------------------------------------
 const rawBackendUrl =
   import.meta.env.VITE_BACKEND_URL || "http://localhost:5000";
-const BACKEND_URL = rawBackendUrl.replace(/\/+$/, "");
+const BACKEND_URL = rawBackendUrl.trim().replace(/\/+$/, "").replace(/\/api$/, "");
 
 // Maximum chart points retained in the browser (independent of backend)
 const MAX_CHART_POINTS = 100;

@@ -216,14 +216,10 @@ mqttClient.on("close", () => {
 // -------------------------------------------------------
 mqttClient.on("message", (topic, message) => {
   const raw = message.toString().trim();
-
-mqttClient.on("message", (topic, message) => {
-  const raw = message.toString().trim();
-
   console.log(`[MQTT RECEIVED] Topic: ${topic} | Message: ${raw}`);
 
   // 1. Device status topic
-  if (topic === STATUS_TOPIC) {
+  if (topic === STATUS_TOPIC || topic.endsWith("/status")) {
     lastDevicePing = Date.now();
     console.log(`[Status Topic] Received: "${raw}"`);
 
@@ -249,7 +245,7 @@ mqttClient.on("message", (topic, message) => {
   }
 
   // 2. Sensor data topic
-  if (topic === DATA_TOPIC) {
+  if (topic === DATA_TOPIC || topic.endsWith("/data")) {
     let sensor;
     try {
       sensor = JSON.parse(raw);

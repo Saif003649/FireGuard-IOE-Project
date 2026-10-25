@@ -238,15 +238,20 @@ void publishData(float temperature, float humidity, int smoke) {
   json += "\"uptime\":"      + String(uptimeSec);
   json += "}";
 
-  bool dataSent   = mqttClient.publish(TOPIC_DATA,   json.c_str());
-  bool statusSent = mqttClient.publish(TOPIC_STATUS, currentStatus.c_str());
+bool dataSent = mqttClient.publish(
+  TOPIC_DATA, json.c_str()
+);
 
-  if (dataSent && statusSent) {
-    Serial.print("[MQTT] Published: ");
-    Serial.println(json);
-  } else {
-    Serial.println("[MQTT] Publish failed — check buffer size or connection.");
-  }
+bool statusSent = mqttClient.publish(
+  TOPIC_STATUS, currentStatus.c_str()
+);
+
+if (dataSent && statusSent) {
+  Serial.print("[MQTT] Published: ");
+  Serial.println(json); 
+} else {
+  Serial.println("[MQTT] Publish failed — check buffer size or connection.");
+}
 }
 
 // ============================================================
