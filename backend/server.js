@@ -148,14 +148,18 @@ mqttClient.on("connect", () => {
   mqttConnectTime = new Date().toISOString();
   console.log(`[MQTT] Successfully connected to broker: ${MQTT_URL}`);
 
-  mqttClient.subscribe([DATA_TOPIC, STATUS_TOPIC], { qos: 0 }, (err, granted) => {
-    if (err) {
-      console.error(`[MQTT] Subscription error on [${DATA_TOPIC}, ${STATUS_TOPIC}]:`, err.message);
-    } else {
-      console.log(`[MQTT] Subscribed to FireGuard topics:`);
-      granted.forEach((g) => console.log(`   - Topic: "${g.topic}" (QoS ${g.qos})`));
-    }
-  });
+ 
+mqttClient.subscribe("fireguard/demo01/#", { qos: 0 }, (err, granted) => {
+  if (err) {
+    console.error("[MQTT SUBSCRIBE ERROR]", err.message);
+  } else {
+    console.log("[MQTT SUBSCRIBED] fireguard/demo01/#");
+    granted.forEach((g) => {
+      console.log(`[MQTT TOPIC] ${g.topic} (QoS ${g.qos})`);
+    });
+  }
+});
+
 
   io.emit("mqttStatus", {
     connected:   true,
@@ -212,6 +216,11 @@ mqttClient.on("close", () => {
 // -------------------------------------------------------
 mqttClient.on("message", (topic, message) => {
   const raw = message.toString().trim();
+
+mqttClient.on("message", (topic, message) => {
+  const raw = message.toString().trim();
+
+  console.log(`[MQTT RECEIVED] Topic: ${topic} | Message: ${raw}`);
 
   // 1. Device status topic
   if (topic === STATUS_TOPIC) {
