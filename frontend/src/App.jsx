@@ -16,7 +16,7 @@ import "./index.css";
 // Backend URL — set VITE_BACKEND_URL in frontend/.env or Vercel settings
 // ---------------------------------------------------------------------------
 const rawBackendUrl =
-  import.meta.env.VITE_BACKEND_URL || "http://localhost:5000";
+  import.meta.env.VITE_BACKEND_URL || "https://fireguard-backend.onrender.com";
 const BACKEND_URL = rawBackendUrl.trim().replace(/\/+$/, "").replace(/\/api$/, "");
 
 // Maximum chart points retained in the browser (independent of backend)
