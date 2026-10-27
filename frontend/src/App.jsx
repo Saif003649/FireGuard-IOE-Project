@@ -16,7 +16,7 @@ import "./index.css";
 // Backend URL — set VITE_BACKEND_URL in frontend/.env or Vercel settings
 // ---------------------------------------------------------------------------
 const rawBackendUrl =
-  import.meta.env.VITE_BACKEND_URL || "https://fireguard-backend.onrender.com";
+  import.meta.env.VITE_BACKEND_URL || "https://fireguard-ioe-project.onrender.com";
 const BACKEND_URL = rawBackendUrl.trim().replace(/\/+$/, "").replace(/\/api$/, "");
 
 // Maximum chart points retained in the browser (independent of backend)
@@ -475,7 +475,7 @@ export default function App() {
           </h2>
           <p className="muted">
             {!socketConnected && (
-              "Cannot reach Render backend. If Render was asleep on the free tier, it takes 30–50 seconds to boot up."
+              `Cannot reach backend at ${BACKEND_URL}. If Render was asleep on the free tier, it takes 30–50 seconds to boot up.`
             )}
             {socketConnected && !mqttConnected && (
               `Backend is online, but disconnected from MQTT broker (${mqttBroker}). The backend is automatically reconnecting.`
