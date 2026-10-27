@@ -51,6 +51,7 @@ const server = http.createServer(app);
 
 // Dynamically allow Vercel domains, localhost, or any configured origin
 const allowedOriginCheck = (origin, callback) => {
+  // Allow requests with no Origin header (server-to-server, curl, health checks)
   if (!origin) return callback(null, true);
   if (
     origin.includes("localhost") ||
@@ -60,13 +61,15 @@ const allowedOriginCheck = (origin, callback) => {
   ) {
     return callback(null, true);
   }
-  return callback(null, true);
+  console.warn(`[CORS] Blocked request from origin: ${origin}`);
+  return callback(new Error("CORS: origin not allowed"), false);
 };
 
 const io = new Server(server, {
   cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
+    origin: allowedOriginCheck,
+    methods: ["GET", "POST"],
+    credentials: true
   }
 });
 

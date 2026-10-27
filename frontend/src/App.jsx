@@ -26,13 +26,9 @@ const MAX_CHART_POINTS = 100;
 // Socket instance (module-level so it survives re-renders)
 // ---------------------------------------------------------------------------
 
-const socket = io(
-  import.meta.env.VITE_BACKEND_URL ||
-    "https://fireguard-backend.onrender.com",
-  {
-    transports: ["websocket", "polling"],
-  }
-);
+const socket = io(BACKEND_URL, {
+  transports: ["websocket", "polling"],
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -287,7 +283,7 @@ export default function App() {
 
   useEffect(() => {
     // 1. Fetch initial health and history from backend
-    fetch(fetch(`${import.meta.env.VITE_BACKEND_URL || "https://fireguard-backend.onrender.com"}/api/health`))
+    fetch(`${BACKEND_URL}/api/health`)
       .then((res) => (res.ok ? res.json() : null))
       .then((health) => {
         if (health && health.mqtt) {
@@ -304,7 +300,7 @@ export default function App() {
         // Backend sleeping or spinning up
       });
 
-    fetch(`${import.meta.env.VITE_BACKEND_URL || "https://fireguard-backend.onrender.com"}/api/history?limit=${MAX_CHART_POINTS}`)
+    fetch(`${BACKEND_URL}/api/history?limit=${MAX_CHART_POINTS}`)
       .then((res) => (res.ok ? res.json() : null))
       .then((json) => {
         if (json && Array.isArray(json.readings) && json.readings.length > 0) {
