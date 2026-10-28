@@ -378,7 +378,7 @@ function AnalysisPanel({
           <div>
             <span className={`conn-pill ${smtpConfigured ? "conn-pill--on" : "conn-pill--warn"}`}>
               <span className="conn-dot" />
-              SMTP Service: {smtpConfigured ? "Configured on Render" : "Env Var Required"}
+              Email API: {smtpConfigured ? "🟢 Resend HTTPS Ready" : "⚪ Key Required on Render"}
             </span>
           </div>
         </div>
@@ -975,7 +975,7 @@ export default function App() {
           <p><span className="detail-label">Backend Target</span> {BACKEND_URL}</p>
           <p><span className="detail-label">Backend Status</span> {socketConnected ? "Online (Socket.IO)" : "Offline"}</p>
           <p><span className="detail-label">Broker Status</span> {mqttConnected ? "Connected" : "Disconnected"}</p>
-          <p><span className="detail-label">Email Service</span> {smtpConfigured ? "🟢 SMTP Ready" : "⚪ SMTP Not Configured"}</p>
+          <p><span className="detail-label">Email Service</span> {smtpConfigured ? "🟢 Resend HTTPS Active (Port 443)" : "⚪ RESEND_API_KEY Missing on Render"}</p>
           <p><span className="detail-label">Active Thresholds</span> Temp: {settings.tempWarning}°C/{settings.tempFire}°C | Smoke: {settings.smokeWarning}/{settings.smokeFire}</p>
           <p><span className="detail-label">Readings Collected</span> {history.length} samples</p>
         </div>

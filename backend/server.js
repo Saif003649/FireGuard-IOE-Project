@@ -10,7 +10,7 @@ const cors       = require("cors");
 const mqtt       = require("mqtt");
 const http       = require("http");
 const { Server } = require("socket.io");
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
 
 // -------------------------------------------------------
 // Configuration & Helpers
@@ -61,38 +61,62 @@ const settings = {
 };
 
 // -------------------------------------------------------
-// Nodemailer / SMTP Email Alert Service
+// Resend HTTPS Email Alert Service
+// (Uses outbound HTTPS on port 443 — works seamlessly on Render free tier)
 // -------------------------------------------------------
-// Defaults to Gmail secure SMTP (smtp.gmail.com, port 465, SSL/TLS) if host/port not overridden
-const SMTP_HOST   = (process.env.SMTP_HOST || "smtp.gmail.com").trim();
-const SMTP_PORT   = parseInt(process.env.SMTP_PORT || "465", 10);
-const SMTP_SECURE = process.env.SMTP_SECURE ? (process.env.SMTP_SECURE === "true") : (SMTP_PORT === 465);
-const SMTP_USER   = (process.env.SMTP_USER || "").trim();
-const SMTP_PASS   = (process.env.SMTP_PASS || "").trim();
-const ALERT_FROM  = process.env.ALERT_FROM || (SMTP_USER ? `"FireGuard Alert" <${SMTP_USER}>` : '"FireGuard Alert System" <alerts@fireguard.local>');
+const RESEND_API_KEY   = (process.env.RESEND_API_KEY || "").trim();
+const ALERT_FROM       = (process.env.ALERT_FROM || "FireGuard <onboarding@resend.dev>").trim();
 const EMAIL_TEST_TOKEN = (process.env.EMAIL_TEST_TOKEN || "fireguard-test-secret-2026").trim();
+
+const resendClient = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
 // Email deduplication & state tracking
 let lastAlertState    = "SAFE"; // Tracks previous alert state to detect transition into FIRE
 let lastAlertSentTime = 0;
 const ALERT_COOLDOWN_MS = 60000; // 60 seconds minimum between repeat alerts while in continuous FIRE
 
-function getTransporter() {
-  if (!SMTP_USER || !SMTP_PASS) {
-    return null;
+/**
+ * Sends an email via Resend HTTPS REST API.
+ * Never throws an uncaught error. Returns structured { success, messageId, error }.
+ */
+async function sendEmail({ to, subject, text, html }) {
+  if (!resendClient) {
+    console.warn("[Email Service] Resend is not configured (RESEND_API_KEY is missing in Render environment variables).");
+    return {
+      success: false,
+      error: "RESEND_API_KEY is not configured on Render. Outbound HTTPS email cannot be sent."
+    };
   }
-  return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_SECURE,
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS
-    },
-    connectionTimeout: 10000,
-    greetingTimeout: 8000,
-    socketTimeout: 10000
-  });
+
+  // Ensure recipient is an array and filter out empty strings
+  const recipientList = (Array.isArray(to) ? to : [to])
+    .map((e) => (typeof e === "string" ? e.trim() : ""))
+    .filter((e) => e.length > 0);
+
+  if (recipientList.length === 0) {
+    return { success: false, error: "No valid recipient email address provided." };
+  }
+
+  try {
+    const { data, error } = await resendClient.emails.send({
+      from: ALERT_FROM,
+      to: recipientList,
+      subject,
+      text,
+      html
+    });
+
+    if (error) {
+      console.error(`[Resend Error] API returned error: ${error.name || "API_ERROR"} - ${error.message}`);
+      return { success: false, error: error.message, code: error.name };
+    }
+
+    console.log(`[Resend Success] Email accepted by Resend! Message ID: ${data.id}`);
+    return { success: true, messageId: data.id };
+  } catch (err) {
+    console.error(`[Resend Error] Network/HTTPS call failed: ${err.message}`);
+    return { success: false, error: err.message, code: err.code || "REQUEST_FAILED" };
+  }
 }
 
 /**
@@ -135,77 +159,80 @@ async function checkAndSendFireAlert(sensorReading, currentStatus) {
       return;
     }
 
-    const transporter = getTransporter();
-    if (!transporter) {
-      console.warn("[Email Alert] FIRE detected, but SMTP is not configured (SMTP_HOST, SMTP_USER, SMTP_PASS required). Skipping email dispatch.");
+    if (!resendClient) {
+      console.warn("[Email Alert] FIRE detected, but RESEND_API_KEY is not configured in Render environment variables. Skipping email dispatch.");
       return;
     }
 
     const timeStr = new Date(sensorReading.lastUpdated || now).toLocaleString();
-    const mailOptions = {
-      from: ALERT_FROM,
-      to: recipients.join(", "),
-      subject: `🚨 [CRITICAL ALERT] Fire Alarm Detected by FireGuard (${sensorReading.device})`,
-      text: `EMERGENCY ALERT: Fire Alarm Detected!\n\n` +
-            `Device ID: ${sensorReading.device}\n` +
-            `Status: ${currentStatus}\n` +
-            `Temperature: ${sensorReading.temperature !== null ? sensorReading.temperature + ' °C' : 'N/A'}\n` +
-            `Humidity: ${sensorReading.humidity !== null ? sensorReading.humidity + ' %' : 'N/A'}\n` +
-            `Smoke Level (ADC): ${sensorReading.smoke !== null ? sensorReading.smoke : 'N/A'}\n` +
-            `Timestamp: ${timeStr}\n\n` +
-            `Emergency contacts notified: User, Ambulance Service, Fire Department.`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 2px solid #dc2626; border-radius: 8px; overflow: hidden;">
-          <div style="background-color: #dc2626; color: #ffffff; padding: 18px 24px; text-align: center;">
-            <h1 style="margin: 0; font-size: 24px;">🚨 FIRE ALARM DETECTED</h1>
-            <p style="margin: 4px 0 0; font-size: 14px;">FireGuard Smart Fire Detection System</p>
-          </div>
-          <div style="padding: 24px; background-color: #ffffff; color: #1e293b;">
-            <p style="font-size: 16px; font-weight: bold; color: #b91c1c; margin-top: 0;">
-              Critical fire event detected! Immediate action required.
-            </p>
-            <table style="width: 100%; border-collapse: collapse; margin: 18px 0; font-size: 14px;">
-              <tr style="border-bottom: 1px solid #e2e8f0;">
-                <td style="padding: 10px 0; font-weight: bold; color: #64748b;">Device ID:</td>
-                <td style="padding: 10px 0; font-weight: bold;">${sensorReading.device}</td>
-              </tr>
-              <tr style="border-bottom: 1px solid #e2e8f0;">
-                <td style="padding: 10px 0; font-weight: bold; color: #64748b;">Status:</td>
-                <td style="padding: 10px 0;"><span style="background: #fee2e2; color: #991b1b; padding: 4px 10px; border-radius: 999px; font-weight: bold;">${currentStatus}</span></td>
-              </tr>
-              <tr style="border-bottom: 1px solid #e2e8f0;">
-                <td style="padding: 10px 0; font-weight: bold; color: #64748b;">Temperature:</td>
-                <td style="padding: 10px 0; font-weight: bold; color: #dc2626;">${sensorReading.temperature !== null ? sensorReading.temperature + ' °C' : 'N/A'}</td>
-              </tr>
-              <tr style="border-bottom: 1px solid #e2e8f0;">
-                <td style="padding: 10px 0; font-weight: bold; color: #64748b;">Humidity:</td>
-                <td style="padding: 10px 0;">${sensorReading.humidity !== null ? sensorReading.humidity + ' %' : 'N/A'}</td>
-              </tr>
-              <tr style="border-bottom: 1px solid #e2e8f0;">
-                <td style="padding: 10px 0; font-weight: bold; color: #64748b;">Smoke ADC:</td>
-                <td style="padding: 10px 0; font-weight: bold; color: #dc2626;">${sensorReading.smoke !== null ? sensorReading.smoke : 'N/A'}</td>
-              </tr>
-              <tr>
-                <td style="padding: 10px 0; font-weight: bold; color: #64748b;">Timestamp:</td>
-                <td style="padding: 10px 0;">${timeStr}</td>
-              </tr>
-            </table>
-            <p style="font-size: 13px; color: #64748b; margin-bottom: 0;">
-              This automated alert was dispatched to: Registered User, Ambulance Service, and Fire Department.
-            </p>
-          </div>
-        </div>
-      `
-    };
+    console.log(`[Email Alert] Transition into FIRE detected! Dispatching emergency alert emails to: ${recipients.join(", ")}`);
 
-    console.log(`[Email Alert] Sending fire alarm emails to: ${recipients.join(", ")}`);
-    transporter.sendMail(mailOptions, (err, info) => {
-      if (err) {
-        console.error(`[Email Alert Error] Failed to send email alert: ${err.message}`);
-      } else {
-        console.log(`[Email Alert] Fire alert email dispatched successfully! (ID: ${info.messageId})`);
-      }
+    const mailSubject = `🚨 [CRITICAL ALERT] Fire Alarm Detected by FireGuard (${sensorReading.device})`;
+    const mailText =
+      `EMERGENCY ALERT: Fire Alarm Detected!\n\n` +
+      `Device ID: ${sensorReading.device}\n` +
+      `Status: ${currentStatus}\n` +
+      `Temperature: ${sensorReading.temperature !== null ? sensorReading.temperature + ' °C' : 'N/A'}\n` +
+      `Humidity: ${sensorReading.humidity !== null ? sensorReading.humidity + ' %' : 'N/A'}\n` +
+      `Smoke Level (ADC): ${sensorReading.smoke !== null ? sensorReading.smoke : 'N/A'}\n` +
+      `Timestamp: ${timeStr}\n\n` +
+      `Emergency contacts notified: User, Ambulance Service, Fire Department.`;
+
+    const mailHtml = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 2px solid #dc2626; border-radius: 8px; overflow: hidden;">
+        <div style="background-color: #dc2626; color: #ffffff; padding: 18px 24px; text-align: center;">
+          <h1 style="margin: 0; font-size: 24px;">🚨 FIRE ALARM DETECTED</h1>
+          <p style="margin: 4px 0 0; font-size: 14px;">FireGuard Smart Fire Detection System</p>
+        </div>
+        <div style="padding: 24px; background-color: #ffffff; color: #1e293b;">
+          <p style="font-size: 16px; font-weight: bold; color: #b91c1c; margin-top: 0;">
+            Critical fire event detected! Immediate action required.
+          </p>
+          <table style="width: 100%; border-collapse: collapse; margin: 18px 0; font-size: 14px;">
+            <tr style="border-bottom: 1px solid #e2e8f0;">
+              <td style="padding: 10px 0; font-weight: bold; color: #64748b;">Device ID:</td>
+              <td style="padding: 10px 0; font-weight: bold;">${sensorReading.device}</td>
+            </tr>
+            <tr style="border-bottom: 1px solid #e2e8f0;">
+              <td style="padding: 10px 0; font-weight: bold; color: #64748b;">Status:</td>
+              <td style="padding: 10px 0;"><span style="background: #fee2e2; color: #991b1b; padding: 4px 10px; border-radius: 999px; font-weight: bold;">${currentStatus}</span></td>
+            </tr>
+            <tr style="border-bottom: 1px solid #e2e8f0;">
+              <td style="padding: 10px 0; font-weight: bold; color: #64748b;">Temperature:</td>
+              <td style="padding: 10px 0; font-weight: bold; color: #dc2626;">${sensorReading.temperature !== null ? sensorReading.temperature + ' °C' : 'N/A'}</td>
+            </tr>
+            <tr style="border-bottom: 1px solid #e2e8f0;">
+              <td style="padding: 10px 0; font-weight: bold; color: #64748b;">Humidity:</td>
+              <td style="padding: 10px 0;">${sensorReading.humidity !== null ? sensorReading.humidity + ' %' : 'N/A'}</td>
+            </tr>
+            <tr style="border-bottom: 1px solid #e2e8f0;">
+              <td style="padding: 10px 0; font-weight: bold; color: #64748b;">Smoke ADC:</td>
+              <td style="padding: 10px 0; font-weight: bold; color: #dc2626;">${sensorReading.smoke !== null ? sensorReading.smoke : 'N/A'}</td>
+            </tr>
+            <tr>
+              <td style="padding: 10px 0; font-weight: bold; color: #64748b;">Timestamp:</td>
+              <td style="padding: 10px 0;">${timeStr}</td>
+            </tr>
+          </table>
+          <p style="font-size: 13px; color: #64748b; margin-bottom: 0;">
+            This automated alert was dispatched via Resend HTTPS API to: Registered User, Ambulance Service, and Fire Department.
+          </p>
+        </div>
+      </div>
+    `;
+
+    const result = await sendEmail({
+      to: recipients,
+      subject: mailSubject,
+      text: mailText,
+      html: mailHtml
     });
+
+    if (result.success) {
+      console.log(`[Email Alert] Fire alert successfully accepted by Resend! (ID: ${result.messageId})`);
+    } else {
+      console.error(`[Email Alert Error] Failed to send email alert: ${result.error}`);
+    }
   }
 }
 
@@ -503,6 +530,7 @@ app.get("/", (req, res) => {
   res.json({
     service:   "FireGuard Backend",
     status:    "running",
+    emailApi:  Boolean(RESEND_API_KEY) ? "Resend HTTPS API" : "Not configured",
     timestamp: new Date().toISOString()
   });
 });
@@ -527,13 +555,15 @@ app.get("/api/health", (req, res) => {
       currentStatus:           latestData.status
     },
     emailAlerts: {
-      smtpConfigured: Boolean(SMTP_HOST && SMTP_USER && SMTP_PASS),
-      lastAlertState: lastAlertState,
+      provider:        "Resend HTTPS API",
+      configured:      Boolean(RESEND_API_KEY),
+      smtpConfigured:  Boolean(RESEND_API_KEY), // backward compatibility for frontend
+      lastAlertState:  lastAlertState,
       lastAlertSentAt: lastAlertSentTime ? new Date(lastAlertSentTime).toISOString() : null,
       recipientsConfigured: {
-        user: Boolean(settings.recipients.userEmail),
+        user:      Boolean(settings.recipients.userEmail),
         ambulance: Boolean(settings.recipients.ambulanceEmail),
-        fireDept: Boolean(settings.recipients.fireDeptEmail)
+        fireDept:  Boolean(settings.recipients.fireDeptEmail)
       }
     },
     settings: {
@@ -581,7 +611,9 @@ app.get("/api/settings", (req, res) => {
         fireDeptEmail:  settings.recipients.fireDeptEmail
       }
     },
-    smtpConfigured: Boolean(SMTP_HOST && SMTP_USER && SMTP_PASS)
+    provider: "Resend HTTPS API",
+    smtpConfigured: Boolean(RESEND_API_KEY),
+    emailConfigured: Boolean(RESEND_API_KEY)
   });
 });
 
@@ -632,7 +664,8 @@ app.post("/api/settings", (req, res) => {
 
   io.emit("settingsUpdated", {
     settings,
-    smtpConfigured: Boolean(SMTP_HOST && SMTP_USER && SMTP_PASS)
+    smtpConfigured: Boolean(RESEND_API_KEY),
+    emailConfigured: Boolean(RESEND_API_KEY)
   });
 
   if (errors.length > 0) {
@@ -643,7 +676,7 @@ app.post("/api/settings", (req, res) => {
   return res.json({ success: true, settings });
 });
 
-/** POST /api/email/test — Protected test endpoint to verify SMTP credentials and email delivery without a fire event */
+/** POST /api/email/test — Protected test endpoint using Resend HTTPS API */
 app.post("/api/email/test", async (req, res) => {
   const token = req.headers["x-test-token"] || req.query.token || (req.body && req.body.token);
 
@@ -655,62 +688,64 @@ app.post("/api/email/test", async (req, res) => {
   const targetRecipient = (req.body && req.body.email) || settings.recipients.userEmail;
   if (!targetRecipient) {
     console.warn("[Email Test] Failed: No user recipient email configured in settings or request body.");
-    return res.status(400).json({ error: "No recipient email configured. Please provide a recipient in body or settings." });
+    return res.status(400).json({ error: "No recipient email configured. Please provide a recipient email in body or settings." });
   }
 
-  const transporter = getTransporter();
-  if (!transporter) {
-    console.warn("[Email Test] Failed: SMTP credentials missing (SMTP_USER and SMTP_PASS environment variables are required).");
+  if (!resendClient) {
+    console.warn("[Email Test] Failed: RESEND_API_KEY environment variable is not configured on Render.");
     return res.status(500).json({
-      error: "SMTP not configured on Render. Please set SMTP_USER and SMTP_PASS in environment variables.",
-      smtpConfigured: false
+      error: "RESEND_API_KEY is missing on Render. Please add RESEND_API_KEY in Render Environment Variables.",
+      provider: "Resend HTTPS API",
+      configured: false
     });
   }
 
-  console.log(`[Email Test] Attempting test email dispatch via ${SMTP_HOST}:${SMTP_PORT} to ${targetRecipient}...`);
+  console.log(`[Email Test] Attempting test email dispatch via Resend HTTPS API to ${targetRecipient}...`);
 
-  try {
-    // 1. Verify SMTP connection first
-    await transporter.verify();
-    console.log("[Email Test] SMTP connection & authentication verified successfully.");
+  const mailSubject = "🧪 [TEST] FireGuard Alert System — Resend HTTPS Verification";
+  const mailText =
+    `This is a test notification from FireGuard Alert System via Resend HTTPS API.\n\n` +
+    `Timestamp: ${new Date().toISOString()}\n` +
+    `Sender: ${ALERT_FROM}\n` +
+    `Target Recipient: ${targetRecipient}\n\n` +
+    `Your HTTPS email delivery on Render is properly configured and operational!`;
 
-    // 2. Dispatch test message
-    const info = await transporter.sendMail({
-      from: ALERT_FROM,
-      to: targetRecipient,
-      subject: "🧪 [TEST] FireGuard Alert System Verification",
-      text: `This is a test notification from FireGuard Alert System.\n\n` +
-            `Timestamp: ${new Date().toISOString()}\n` +
-            `SMTP Host: ${SMTP_HOST}:${SMTP_PORT}\n` +
-            `Target Recipient: ${targetRecipient}\n\n` +
-            `Your email notification service is properly configured and operational!`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 540px; margin: 0 auto; border: 1px solid #cbd5e1; border-radius: 8px; padding: 20px;">
-          <h2 style="color: #0284c7; margin-top: 0;">🧪 FireGuard Email Service Test</h2>
-          <p>This is a test notification confirming your SMTP email service is operational on Render.</p>
-          <ul style="color: #334155; line-height: 1.6;">
-            <li><strong>SMTP Server:</strong> ${SMTP_HOST}:${SMTP_PORT} (SSL: ${SMTP_SECURE})</li>
-            <li><strong>Recipient:</strong> ${targetRecipient}</li>
-            <li><strong>Timestamp:</strong> ${new Date().toLocaleString()}</li>
-            <li><strong>Status:</strong> Ready for real-time fire alerts</li>
-          </ul>
-        </div>
-      `
-    });
+  const mailHtml = `
+    <div style="font-family: Arial, sans-serif; max-width: 540px; margin: 0 auto; border: 1px solid #cbd5e1; border-radius: 8px; padding: 20px;">
+      <h2 style="color: #0284c7; margin-top: 0;">🧪 FireGuard Resend HTTPS Test</h2>
+      <p>This is a test notification confirming your HTTPS email service is operational on Render.</p>
+      <ul style="color: #334155; line-height: 1.6;">
+        <li><strong>Provider:</strong> Resend HTTPS REST API (Port 443)</li>
+        <li><strong>Sender:</strong> ${ALERT_FROM}</li>
+        <li><strong>Recipient:</strong> ${targetRecipient}</li>
+        <li><strong>Timestamp:</strong> ${new Date().toLocaleString()}</li>
+        <li><strong>Status:</strong> Ready for real-time fire alerts</li>
+      </ul>
+    </div>
+  `;
 
-    console.log(`[Email Test] Test email sent successfully! MessageId: ${info.messageId}`);
+  const result = await sendEmail({
+    to: targetRecipient,
+    subject: mailSubject,
+    text: mailText,
+    html: mailHtml
+  });
+
+  if (result.success) {
+    console.log(`[Email Test] Test email sent successfully! Resend MessageId: ${result.messageId}`);
     return res.json({
       success: true,
-      message: `Test email successfully sent to ${targetRecipient}`,
-      messageId: info.messageId,
+      provider: "Resend HTTPS API",
+      message: `Test email successfully accepted by Resend and dispatched to ${targetRecipient}`,
+      messageId: result.messageId,
       timestamp: new Date().toISOString()
     });
-  } catch (err) {
-    console.error(`[Email Test Error] SMTP failure: ${err.code || "UNKNOWN"} - ${err.message}`);
+  } else {
+    console.error(`[Email Test Error] Resend dispatch failed: ${result.code || "UNKNOWN"} - ${result.error}`);
     return res.status(502).json({
-      error: "SMTP delivery failed",
-      code: err.code || "SMTP_ERROR",
-      message: err.message
+      error: "Resend delivery failed",
+      code: result.code || "RESEND_ERROR",
+      message: result.error
     });
   }
 });
@@ -747,7 +782,8 @@ io.on("connection", (socket) => {
 
   socket.emit("settingsUpdated", {
     settings,
-    smtpConfigured: Boolean(SMTP_HOST && SMTP_USER && SMTP_PASS)
+    smtpConfigured: Boolean(RESEND_API_KEY),
+    emailConfigured: Boolean(RESEND_API_KEY)
   });
 
   socket.on("disconnect", () => {
@@ -766,7 +802,7 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`  Data topic   : ${DATA_TOPIC}`);
   console.log(`  Status topic : ${STATUS_TOPIC}`);
   console.log(`  Max history  : ${MAX_HISTORY} readings`);
-  console.log(`  SMTP Status  : ${SMTP_HOST && SMTP_USER && SMTP_PASS ? "Configured (" + SMTP_HOST + ")" : "Not configured"}`);
+  console.log(`  Email API    : ${RESEND_API_KEY ? "Resend HTTPS API Configured" : "RESEND_API_KEY Not set"}`);
   if (FRONTEND_URL) {
     console.log(`  CORS allowed : ${FRONTEND_URL}`);
   }
@@ -778,5 +814,6 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`    GET http://localhost:${PORT}/api/history`);
   console.log(`    GET http://localhost:${PORT}/api/settings`);
   console.log(`    POST http://localhost:${PORT}/api/settings`);
+  console.log(`    POST http://localhost:${PORT}/api/email/test`);
   console.log("================================================");
 });
