@@ -63,12 +63,14 @@ const settings = {
 // -------------------------------------------------------
 // Nodemailer / SMTP Email Alert Service
 // -------------------------------------------------------
-const SMTP_HOST   = (process.env.SMTP_HOST || "").trim();
-const SMTP_PORT   = parseInt(process.env.SMTP_PORT || "587", 10);
-const SMTP_SECURE = process.env.SMTP_SECURE === "true" || SMTP_PORT === 465;
+// Defaults to Gmail secure SMTP (smtp.gmail.com, port 465, SSL/TLS) if host/port not overridden
+const SMTP_HOST   = (process.env.SMTP_HOST || "smtp.gmail.com").trim();
+const SMTP_PORT   = parseInt(process.env.SMTP_PORT || "465", 10);
+const SMTP_SECURE = process.env.SMTP_SECURE ? (process.env.SMTP_SECURE === "true") : (SMTP_PORT === 465);
 const SMTP_USER   = (process.env.SMTP_USER || "").trim();
 const SMTP_PASS   = (process.env.SMTP_PASS || "").trim();
 const ALERT_FROM  = process.env.ALERT_FROM || (SMTP_USER ? `"FireGuard Alert" <${SMTP_USER}>` : '"FireGuard Alert System" <alerts@fireguard.local>');
+const EMAIL_TEST_TOKEN = (process.env.EMAIL_TEST_TOKEN || "fireguard-test-secret-2026").trim();
 
 // Email deduplication & state tracking
 let lastAlertState    = "SAFE"; // Tracks previous alert state to detect transition into FIRE
@@ -76,7 +78,7 @@ let lastAlertSentTime = 0;
 const ALERT_COOLDOWN_MS = 60000; // 60 seconds minimum between repeat alerts while in continuous FIRE
 
 function getTransporter() {
-  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
+  if (!SMTP_USER || !SMTP_PASS) {
     return null;
   }
   return nodemailer.createTransport({
@@ -88,7 +90,7 @@ function getTransporter() {
       pass: SMTP_PASS
     },
     connectionTimeout: 10000,
-    greetingTimeout: 5000,
+    greetingTimeout: 8000,
     socketTimeout: 10000
   });
 }
@@ -639,6 +641,78 @@ app.post("/api/settings", (req, res) => {
 
   console.log(`[Settings] Updated: Temp(${settings.tempWarning}/${settings.tempFire}°C), Smoke(${settings.smokeWarning}/${settings.smokeFire}), HumWarn(${settings.humWarning}%)`);
   return res.json({ success: true, settings });
+});
+
+/** POST /api/email/test — Protected test endpoint to verify SMTP credentials and email delivery without a fire event */
+app.post("/api/email/test", async (req, res) => {
+  const token = req.headers["x-test-token"] || req.query.token || (req.body && req.body.token);
+
+  if (!token || token !== EMAIL_TEST_TOKEN) {
+    console.warn("[Email Test] Unauthorized test attempt: invalid or missing token.");
+    return res.status(401).json({ error: "Unauthorized: Invalid or missing test token" });
+  }
+
+  const targetRecipient = (req.body && req.body.email) || settings.recipients.userEmail;
+  if (!targetRecipient) {
+    console.warn("[Email Test] Failed: No user recipient email configured in settings or request body.");
+    return res.status(400).json({ error: "No recipient email configured. Please provide a recipient in body or settings." });
+  }
+
+  const transporter = getTransporter();
+  if (!transporter) {
+    console.warn("[Email Test] Failed: SMTP credentials missing (SMTP_USER and SMTP_PASS environment variables are required).");
+    return res.status(500).json({
+      error: "SMTP not configured on Render. Please set SMTP_USER and SMTP_PASS in environment variables.",
+      smtpConfigured: false
+    });
+  }
+
+  console.log(`[Email Test] Attempting test email dispatch via ${SMTP_HOST}:${SMTP_PORT} to ${targetRecipient}...`);
+
+  try {
+    // 1. Verify SMTP connection first
+    await transporter.verify();
+    console.log("[Email Test] SMTP connection & authentication verified successfully.");
+
+    // 2. Dispatch test message
+    const info = await transporter.sendMail({
+      from: ALERT_FROM,
+      to: targetRecipient,
+      subject: "🧪 [TEST] FireGuard Alert System Verification",
+      text: `This is a test notification from FireGuard Alert System.\n\n` +
+            `Timestamp: ${new Date().toISOString()}\n` +
+            `SMTP Host: ${SMTP_HOST}:${SMTP_PORT}\n` +
+            `Target Recipient: ${targetRecipient}\n\n` +
+            `Your email notification service is properly configured and operational!`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 540px; margin: 0 auto; border: 1px solid #cbd5e1; border-radius: 8px; padding: 20px;">
+          <h2 style="color: #0284c7; margin-top: 0;">🧪 FireGuard Email Service Test</h2>
+          <p>This is a test notification confirming your SMTP email service is operational on Render.</p>
+          <ul style="color: #334155; line-height: 1.6;">
+            <li><strong>SMTP Server:</strong> ${SMTP_HOST}:${SMTP_PORT} (SSL: ${SMTP_SECURE})</li>
+            <li><strong>Recipient:</strong> ${targetRecipient}</li>
+            <li><strong>Timestamp:</strong> ${new Date().toLocaleString()}</li>
+            <li><strong>Status:</strong> Ready for real-time fire alerts</li>
+          </ul>
+        </div>
+      `
+    });
+
+    console.log(`[Email Test] Test email sent successfully! MessageId: ${info.messageId}`);
+    return res.json({
+      success: true,
+      message: `Test email successfully sent to ${targetRecipient}`,
+      messageId: info.messageId,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error(`[Email Test Error] SMTP failure: ${err.code || "UNKNOWN"} - ${err.message}`);
+    return res.status(502).json({
+      error: "SMTP delivery failed",
+      code: err.code || "SMTP_ERROR",
+      message: err.message
+    });
+  }
 });
 
 // 404 fallback
