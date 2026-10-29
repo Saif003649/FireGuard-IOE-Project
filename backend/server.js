@@ -47,6 +47,8 @@ const MQTT_URL     = normalizeMqttUrl(RAW_MQTT_URL);
 // -------------------------------------------------------
 // Thresholds & Alert Configuration (Adjustable & Persisted in Memory)
 // -------------------------------------------------------
+const ALERT_EMAIL_TO = (process.env.ALERT_EMAIL_TO || process.env.ALERT_USER_EMAIL || "").trim();
+
 const settings = {
   tempWarning:  parseFloat(process.env.DEFAULT_TEMP_WARNING  || "40.0"),
   tempFire:     parseFloat(process.env.DEFAULT_TEMP_FIRE     || "60.0"),
@@ -54,7 +56,7 @@ const settings = {
   smokeWarning: parseInt(process.env.DEFAULT_SMOKE_WARNING   || "2800", 10),
   smokeFire:    parseInt(process.env.DEFAULT_SMOKE_FIRE      || "3500", 10),
   recipients: {
-    userEmail:      (process.env.ALERT_USER_EMAIL      || "").trim(),
+    userEmail:      ALERT_EMAIL_TO,
     ambulanceEmail: (process.env.ALERT_AMBULANCE_EMAIL || "").trim(),
     fireDeptEmail:  (process.env.ALERT_FIRE_DEPT_EMAIL || "").trim()
   }
@@ -65,10 +67,13 @@ const settings = {
 // (Uses outbound HTTPS on port 443 — works seamlessly on Render free tier)
 // -------------------------------------------------------
 const RESEND_API_KEY   = (process.env.RESEND_API_KEY || "").trim();
-const ALERT_FROM       = (process.env.ALERT_FROM || "FireGuard <onboarding@resend.dev>").trim();
+const EMAIL_FROM_RAW   = (process.env.EMAIL_FROM || process.env.ALERT_FROM || "onboarding@resend.dev").trim();
+// Ensure formatted sender display: "FireGuard <onboarding@resend.dev>" or custom domain
+const EMAIL_FROM       = EMAIL_FROM_RAW.includes("<") ? EMAIL_FROM_RAW : `FireGuard <${EMAIL_FROM_RAW}>`;
 const EMAIL_TEST_TOKEN = (process.env.EMAIL_TEST_TOKEN || "fireguard-test-secret-2026").trim();
 
 const resendClient = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+const isTestingSender = EMAIL_FROM.includes("resend.dev");
 
 // Email deduplication & state tracking
 let lastAlertState    = "SAFE"; // Tracks previous alert state to detect transition into FIRE
@@ -99,7 +104,7 @@ async function sendEmail({ to, subject, text, html }) {
 
   try {
     const { data, error } = await resendClient.emails.send({
-      from: ALERT_FROM,
+      from: EMAIL_FROM,
       to: recipientList,
       subject,
       text,
@@ -149,13 +154,24 @@ async function checkAndSendFireAlert(sensorReading, currentStatus) {
     lastAlertSentTime = now;
 
     // Collect configured recipients
-    const recipients = [];
-    if (settings.recipients.userEmail)      recipients.push(settings.recipients.userEmail);
-    if (settings.recipients.ambulanceEmail) recipients.push(settings.recipients.ambulanceEmail);
-    if (settings.recipients.fireDeptEmail)  recipients.push(settings.recipients.fireDeptEmail);
+    // NOTE: When using Resend's testing sender (onboarding@resend.dev), Resend strictly requires
+    // sending only to your own registered account email. Sending to unverified addresses fails.
+    let recipients = [];
+    const primaryAccountEmail = ALERT_EMAIL_TO || settings.recipients.userEmail;
+
+    if (isTestingSender) {
+      if (primaryAccountEmail) {
+        recipients = [primaryAccountEmail];
+        console.log(`[Email Alert] Testing mode (onboarding@resend.dev): sending alert exclusively to registered account email (${primaryAccountEmail}).`);
+      }
+    } else {
+      if (primaryAccountEmail)                recipients.push(primaryAccountEmail);
+      if (settings.recipients.ambulanceEmail) recipients.push(settings.recipients.ambulanceEmail);
+      if (settings.recipients.fireDeptEmail)  recipients.push(settings.recipients.fireDeptEmail);
+    }
 
     if (recipients.length === 0) {
-      console.warn("[Email Alert] FIRE detected, but no recipient email addresses are configured in settings or environment.");
+      console.warn("[Email Alert] FIRE detected, but no recipient email is configured in ALERT_EMAIL_TO or settings.");
       return;
     }
 
@@ -165,7 +181,7 @@ async function checkAndSendFireAlert(sensorReading, currentStatus) {
     }
 
     const timeStr = new Date(sensorReading.lastUpdated || now).toLocaleString();
-    console.log(`[Email Alert] Transition into FIRE detected! Dispatching emergency alert emails to: ${recipients.join(", ")}`);
+    console.log(`[Email Alert] Transition into FIRE detected! Dispatching emergency alert via Resend (${EMAIL_FROM})...`);
 
     const mailSubject = `🚨 [CRITICAL ALERT] Fire Alarm Detected by FireGuard (${sensorReading.device})`;
     const mailText =
@@ -685,10 +701,10 @@ app.post("/api/email/test", async (req, res) => {
     return res.status(401).json({ error: "Unauthorized: Invalid or missing test token" });
   }
 
-  const targetRecipient = (req.body && req.body.email) || settings.recipients.userEmail;
+  const targetRecipient = (req.body && req.body.email) || ALERT_EMAIL_TO || settings.recipients.userEmail;
   if (!targetRecipient) {
-    console.warn("[Email Test] Failed: No user recipient email configured in settings or request body.");
-    return res.status(400).json({ error: "No recipient email configured. Please provide a recipient email in body or settings." });
+    console.warn("[Email Test] Failed: No recipient email configured in ALERT_EMAIL_TO or settings.");
+    return res.status(400).json({ error: "No recipient email configured. Please set ALERT_EMAIL_TO in Render environment variables." });
   }
 
   if (!resendClient) {
@@ -700,27 +716,30 @@ app.post("/api/email/test", async (req, res) => {
     });
   }
 
-  console.log(`[Email Test] Attempting test email dispatch via Resend HTTPS API to ${targetRecipient}...`);
+  console.log(`[Email Test] Attempting test email dispatch via Resend HTTPS API (${EMAIL_FROM}) to ${targetRecipient}...`);
 
-  const mailSubject = "🧪 [TEST] FireGuard Alert System — Resend HTTPS Verification";
+  const mailSubject = "🧪 [TEST] FireGuard Alert System — Resend Verification";
   const mailText =
     `This is a test notification from FireGuard Alert System via Resend HTTPS API.\n\n` +
     `Timestamp: ${new Date().toISOString()}\n` +
-    `Sender: ${ALERT_FROM}\n` +
-    `Target Recipient: ${targetRecipient}\n\n` +
-    `Your HTTPS email delivery on Render is properly configured and operational!`;
+    `Sender: ${EMAIL_FROM}\n` +
+    `Recipient: ${targetRecipient}\n\n` +
+    `If you received this message, your Resend API configuration on Render is working properly!`;
 
   const mailHtml = `
     <div style="font-family: Arial, sans-serif; max-width: 540px; margin: 0 auto; border: 1px solid #cbd5e1; border-radius: 8px; padding: 20px;">
       <h2 style="color: #0284c7; margin-top: 0;">🧪 FireGuard Resend HTTPS Test</h2>
-      <p>This is a test notification confirming your HTTPS email service is operational on Render.</p>
+      <p>This test email confirms your Resend API key and recipient configuration are operational on Render.</p>
       <ul style="color: #334155; line-height: 1.6;">
-        <li><strong>Provider:</strong> Resend HTTPS REST API (Port 443)</li>
-        <li><strong>Sender:</strong> ${ALERT_FROM}</li>
+        <li><strong>Provider:</strong> Resend HTTPS REST API</li>
+        <li><strong>Sender:</strong> ${EMAIL_FROM}</li>
         <li><strong>Recipient:</strong> ${targetRecipient}</li>
         <li><strong>Timestamp:</strong> ${new Date().toLocaleString()}</li>
-        <li><strong>Status:</strong> Ready for real-time fire alerts</li>
+        <li><strong>Status:</strong> Provider accepted message for delivery</li>
       </ul>
+      <p style="font-size: 12px; color: #64748b; margin-top: 14px;">
+        Note: When testing without a custom domain using onboarding@resend.dev, Resend permits sending only to your own account email.
+      </p>
     </div>
   `;
 
@@ -732,11 +751,11 @@ app.post("/api/email/test", async (req, res) => {
   });
 
   if (result.success) {
-    console.log(`[Email Test] Test email sent successfully! Resend MessageId: ${result.messageId}`);
+    console.log(`[Email Test] Test email accepted by Resend provider! Message ID: ${result.messageId}`);
     return res.json({
       success: true,
       provider: "Resend HTTPS API",
-      message: `Test email successfully accepted by Resend and dispatched to ${targetRecipient}`,
+      message: `Test email accepted by Resend API for delivery to ${targetRecipient}`,
       messageId: result.messageId,
       timestamp: new Date().toISOString()
     });
